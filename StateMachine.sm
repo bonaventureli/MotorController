@@ -1,0 +1,330 @@
+//  File: StateMachine.sm
+//  Motor controller state machine declarations
+//  Used as input to SMG (smg.sourceforge.net)
+//
+//  This file is part of the Ember Motor Controller firmware.
+//
+//  Copyright 2015 Autodesk, Inc. <http://ember.autodesk.com/>
+//
+//  Authors:
+//  Jason Lefley
+//
+//  This program is free software: you can redistribute it and/or modify
+//  it under the terms of the GNU General Public License as published by
+//  the Free Software Foundation, either version 2 of the License, or
+//  (at your option) any later version.
+//
+//  THIS PROGRAM IS DISTRIBUTED IN THE HOPE THAT IT WILL BE USEFUL,
+//  BUT WITHOUT ANY WARRANTY; WITHOUT EVEN THE IMPLIED WARRANTY OF
+//  MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.  SEE THE
+//  GNU GENERAL PUBLIC LICENSE FOR MORE DETAILS.
+//
+//  You should have received a copy of the GNU General Public License
+//  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <stdint.h>
+#include <stdio.h>
+#include <avr/pgmspace.h>
+
+// Trace logging macros
+#define SM_TRACE
+#define SM_TRACE_INIT(Obj, Evt, SM_Name, InitState) \
+        printf_P(PSTR("INFO: State machine (%S 0x%x) initialized, current state: %S\n\n"), \
+               PSTR(#SM_Name), Obj, MotorController_State_Name(InitState));
+#define SM_TRACE_EVENT(Obj, Evt, SM_Name, Event) \
+        printf_P(PSTR("INFO: State machine (%S 0x%x) handling %S in %S\n"), \
+               PSTR(#SM_Name), Obj, MotorController_Event_Name(Event), MotorController_State_Name(Obj->sm_state));
+#define SM_TRACE_POST_EVENT(Obj, Evt, SM_Name, Event) \
+        printf_P(PSTR("INFO: State machine (%S 0x%x) transaction complete, current state: %S\n\n"), \
+               PSTR(#SM_Name), Obj, MotorController_State_Name(Obj->sm_state));
+#define SM_TRACE_EXP_EV(Obj, Evt, SM_Name, Event) \
+        printf(PSTR("** SM %S 0x%x: State %d ++ Event %d\n"), \
+               PSTR(#SM_Name), Obj, Obj->sm_state, Event);
+
+#include "StateMachine.h"
+#include "MotorController.h"
+#include "Motors.h"
+#include "EventData.h"
+#include "EventQueue.h"
+#include "MachineDefinitions.h"
+#include "Planner.h"
+
+## State machine name
+SM_NAME MotorController
+
+## Data type representing state machine instantiation
+SM_OBJ MotorController_t*
+
+## Data type of event data
+SM_EVT EventData
+
+// State machine error handler
+// Called if invalid transition encountered
+void MotorController_State_Machine_Error(
+        MotorController_t* mcState,
+        EventData eventData,
+        uint8_t errorID,
+        const char* errorText, ...)
+{
+#ifdef DEBUG
+    printf_P(PSTR("ERROR: Fatal state machine error\n"));
+#endif
+
+    mcState->status = MC_STATUS_STATE_MACHINE_ERROR;
+    mcState->error = true;
+}
+
+#define CHECK_STATUS(function, mcState)  \
+    do                                   \
+    {                                    \
+        Status status = function;        \
+        if (status != MC_STATUS_SUCCESS) \
+        {                                \
+            mcState->status = status;    \
+            mcState->error = true;       \
+        }                                \
+    }                                    \
+    while (0)
+
+static EventQueue eventQueue;
+
+// Reinitialize the event queue
+void MotorController_State_Machine_Reset_EventQueue()
+{
+    eventQueue = EventQueue();
+}
+
+// If the event queue is not empty, dequeue an event and store it in the state instance
+static void DequeueEvent(MotorController_t* mcState)
+{
+    if (!eventQueue.IsEmpty())
+    {
+        mcState->queuedEvent = true;
+        eventQueue.Remove(mcState->queuedEventCode, mcState->queuedEventData);
+    }
+}
+
+STATE Disabled                         The controller disabled the motor drivers and waits for an enable command
+STATE Ready                            The controller enabled the motor drivers and handles incoming or queued commands
+STATE Error                            An error occurred
+STATE HomingZAxis                      The z axis searches for its limit
+STATE HomingRAxis                      The r axis searches for its limit
+STATE MovingAxis                       An axis moves
+STATE WaitingForInterruptRequest       The controller waits for an interrupt request before handling queued action command
+STATE ReadyForAction                   The controller dequeues and handles the next action command (home, move)
+STATE HomingZAxisDeceleratingForPause  The z axis decelerates to a stop from homing for pause
+STATE HomingRAxisDeceleratingForPause  The r axis decelerates to a stop from homing for pause
+STATE MovingAxisDeceleratingForPause   The currently moving axis decelerates to a stop for pause
+STATE HomingZAxisDeceleratingForResume The z axis decelerates to a stop from homing to resume immediately from the pause when deceleration completes
+STATE HomingRAxisDeceleratingForResume The r axis decelerates to a stop from homing to resume immediately from the pause when deceleration completes
+STATE MovingAxisDeceleratingForResume  The currently moving axis decelerates to a stop to resume immediately from the pause when deceleration completes
+STATE HomingZAxisPaused                The controller paused z axis homing
+STATE HomingRAxisPaused                The controller paused r axis homing
+STATE MovingAxisPaused                 The controller paused axis movement
+STATE DeceleratingForCompletion        The axis in motion decelerates as a result of reaching its limit or traversing the requested distance
+STATE DeceleratingAfterClear           The axis in motion decelerates as a result of a pause and but the controller received a clear command before the axis stopped completely
+STATE DeceleratingForSequencePause     The controller received a pause command while an axis decelerates for completion of its move (pauses handling of the queue rather than motion)
+STATE DeceleratingForSequenceResume    The controller received a pause command while an axis decelerates for completion of its move (resumes handling of the queue when deceleration completes)
+STATE SequencePaused                   The controller has paused the process of handling the sequence of commands in the queue and waits for a resume command
+
+EVENT ResetRequested           -- -- Reset command received
+EVENT HomeZAxisRequested       -- -- Home z axis command received
+EVENT HomeRAxisRequested       -- -- Home r axis command received
+EVENT MoveZAxisRequested       -- -- Move z axis command received
+EVENT MoveRAxisRequested       -- -- Move r axis command received
+EVENT DisableRequested         -- -- Disable motor drivers command received
+EVENT EnableRequested          -- -- Enable motor drivers command received
+EVENT SetZAxisSettingRequested -- -- Set z axis setting command received
+EVENT SetRAxisSettingRequested -- -- Set r axis setting command received
+EVENT InterruptRequested       -- -- Generate interrupt command received
+EVENT AxisLimitReached         -- -- Axis limit switched reached
+EVENT MotionComplete           -- -- All moves in motion planning buffer have been executed
+EVENT PauseRequested           -- -- Pause the current motion in progress received
+EVENT ResumeRequested          -- -- Resume the previously paused motion
+EVENT ClearRequested           -- -- Clear command received
+EVENT ErrorEncountered         -- -- An error was encountered
+EVENT DecelerationStarted      -- -- The moving axis started decelerating to complete its move
+EVENT AxisAtLimit              -- -- The system has found the axis requested to home at its limit without requiring movement
+
+## When defining transactions, the defaults involving wildcards need to appear before the more specific definitions
+
+## Enter error state whenever an error occurs
+TRANS * ErrorEncountered Error DisableMotorDrivers
+
+## Dequeue event when returning to the ready states for immediate handling
+TRANS+ DeceleratingForCompletion MotionComplete           -- DequeueEvent
+TRANS+ DeceleratingAfterClear    MotionComplete           -- DequeueEvent
+TRANS+ Ready                     SetZAxisSettingRequested -- DequeueEvent
+TRANS+ Ready                     SetRAxisSettingRequested -- DequeueEvent
+TRANS+ Ready                     InterruptRequested       -- DequeueEvent
+TRANS+ ReadyForAction            InterruptRequested       -- DequeueEvent
+TRANS+ ReadyForAction            SetZAxisSettingRequested -- DequeueEvent
+TRANS+ ReadyForAction            SetRAxisSettingRequested -- DequeueEvent
+
+## Queue incoming commands by default
+TRANS * DisableRequested         -- EnqueueEvent
+TRANS * HomeZAxisRequested       -- EnqueueEvent
+TRANS * HomeRAxisRequested       -- EnqueueEvent
+TRANS * MoveZAxisRequested       -- EnqueueEvent
+TRANS * MoveRAxisRequested       -- EnqueueEvent
+TRANS * SetZAxisSettingRequested -- EnqueueEvent
+TRANS * SetRAxisSettingRequested -- EnqueueEvent
+TRANS * InterruptRequested       -- EnqueueEvent
+
+## Ignore incoming commands other than reset in error state
+TRANS Error EnableRequested          --
+TRANS Error DisableRequested         --
+TRANS Error HomeZAxisRequested       --
+TRANS Error HomeRAxisRequested       --
+TRANS Error MoveZAxisRequested       --
+TRANS Error MoveRAxisRequested       --
+TRANS Error SetZAxisSettingRequested --
+TRANS Error SetRAxisSettingRequested --
+TRANS Error InterruptRequested       --
+
+## Ignore incoming motion commands and disable command in disabled state
+TRANS Disabled DisableRequested   --
+TRANS Disabled HomeZAxisRequested --
+TRANS Disabled HomeRAxisRequested --
+TRANS Disabled MoveZAxisRequested --
+TRANS Disabled MoveRAxisRequested --
+TRANS Disabled InterruptRequested --
+
+## Handle settings in disabled state
+TRANS Disabled SetZAxisSettingRequested -- SetZAxisSetting
+TRANS Disabled SetRAxisSettingRequested -- SetRAxisSetting
+
+## Handling action commands in ready state causes transition to waiting for interrupt state
+## The controller must encounter a subsequent interrupt request before handling the pending action
+TRANS Ready HomeZAxisRequested WaitingForInterruptRequest EnqueueEvent
+TRANS Ready HomeRAxisRequested WaitingForInterruptRequest EnqueueEvent
+TRANS Ready MoveZAxisRequested WaitingForInterruptRequest EnqueueEvent
+TRANS Ready MoveRAxisRequested WaitingForInterruptRequest EnqueueEvent
+
+## Handle non-action commands and commands other than enable immediately when in ready state
+TRANS Ready DisableRequested         Disabled         DisableMotorDrivers
+TRANS Ready SetZAxisSettingRequested --               SetZAxisSetting
+TRANS Ready SetRAxisSettingRequested --               SetRAxisSetting
+TRANS Ready InterruptRequested       --               GenerateInterrupt
+
+## Handle action and setting commands when ready for action
+TRANS ReadyForAction HomeZAxisRequested       HomingZAxis HomeZAxis
+TRANS ReadyForAction HomeRAxisRequested       HomingRAxis HomeRAxis
+TRANS ReadyForAction MoveZAxisRequested       MovingAxis  MoveZAxis
+TRANS ReadyForAction MoveRAxisRequested       MovingAxis  MoveRAxis
+TRANS ReadyForAction SetZAxisSettingRequested --          SetZAxisSetting
+TRANS ReadyForAction SetRAxisSettingRequested --          SetRAxisSetting
+
+## Handle interrupt request by generating interrupt and transitioning out of ready for action state
+TRANS ReadyForAction InterruptRequested Ready GenerateInterrupt
+
+## Handle action commands when controller receives an interrupt request when in pending action
+TRANS+ WaitingForInterruptRequest InterruptRequested ReadyForAction DequeueEvent
+TRANS  WaitingForInterruptRequest InterruptRequested ReadyForAction EnqueueEvent
+
+## Ignore limit reached events except when homing
+TRANS *           AxisLimitReached --
+TRANS HomingZAxis AxisLimitReached DeceleratingForCompletion BeginHold
+TRANS HomingRAxis AxisLimitReached DeceleratingForCompletion BeginHold
+
+## Axis at limit event causes completion of homing without movement
+TRANS *           AxisAtLimit --
+TRANS HomingZAxis AxisAtLimit ReadyForAction DequeueEvent
+TRANS HomingRAxis AxisAtLimit ReadyForAction DequeueEvent
+
+## Reset from any state transitions to disabled
+TRANS * ResetRequested Disabled SetResetFlag
+
+## Handle enable from disabled state, ignore from all other states
+TRANS *        EnableRequested --
+TRANS Disabled EnableRequested Ready EnableMotorDrivers
+
+## Motion complete occurs when done moving
+## If the motion completes as a result of the axis reaching its limit or traversing the requested distance,
+## transition to ready for action to handle next queued action or interrupt request
+## If the motion completes as a result of stopping for a pause after receiving a clear command,
+## transition to ready since the queue contains no action commands needing handling
+## If the motion completes as a result of stopping for a pause, enter the appropriate paused state
+## If the controller will pause by halting queue processing (DeceleratingForSequencePause), enter
+## SequencePaused when deceleration completes to wait for a resume
+## If in a 'DeceleratingForResume' state, MotionComplete results in immediately resuming from the pause
+TRANS *                                MotionComplete --
+TRANS DeceleratingForCompletion        MotionComplete ReadyForAction    EndMotion
+TRANS DeceleratingAfterClear           MotionComplete Ready             EndMotion
+TRANS DeceleratingForSequencePause     MotionComplete SequencePaused    EndMotion
+TRANS MovingAxisDeceleratingForPause   MotionComplete MovingAxisPaused
+TRANS HomingZAxisDeceleratingForPause  MotionComplete HomingZAxisPaused
+TRANS HomingRAxisDeceleratingForPause  MotionComplete HomingRAxisPaused
+TRANS DeceleratingForSequenceResume    MotionComplete ReadyForAction    DequeueEvent
+TRANS MovingAxisDeceleratingForResume  MotionComplete MovingAxis        EndHold
+TRANS HomingZAxisDeceleratingForResume MotionComplete HomingZAxis       EndHold
+TRANS HomingRAxisDeceleratingForResume MotionComplete HomingRAxis       EndHold
+
+## A decelerating started event occurs when a regular or homing movement decelerates to complete covering
+## the distance specified by the command parameter
+TRANS *           DecelerationStarted --
+TRANS MovingAxis  DecelerationStarted DeceleratingForCompletion
+TRANS HomingZAxis DecelerationStarted DeceleratingForCompletion 
+TRANS HomingRAxis DecelerationStarted DeceleratingForCompletion 
+
+## If the axis in motion has not started decelerating for completion, pause results in pausing of the
+## motion (motion hold), transition to appropriate pausing deceleration state
+## If the axis in motion has started decelerating for completion, a motion hold has no effect
+## The controller handles the pause by halting the process of handling enqueued events by first
+## transitioning to the DeceleratingForSequencePause state until the deceleration currently in progress completes
+## Otherwise ignore pause
+TRANS *                         PauseRequested --
+TRANS DeceleratingForCompletion PauseRequested DeceleratingForSequencePause
+TRANS MovingAxis                PauseRequested MovingAxisDeceleratingForPause  BeginHold
+TRANS HomingZAxis               PauseRequested HomingZAxisDeceleratingForPause BeginHold
+TRANS HomingRAxis               PauseRequested HomingRAxisDeceleratingForPause BeginHold
+
+## Resume from paused returns to appropriate motion state
+## Resume when decelerating for pause transitions to appropriate deceleration for resume state where the
+## axis resumes the paused action as soon as the deceleration completes
+## If resuming from SequencePaused, dequeue the next event to handle and transition to ReadyForAction to
+## resume processing the queue
+TRANS *                               ResumeRequested --
+TRANS DeceleratingForSequencePause    ResumeRequested DeceleratingForSequenceResume
+TRANS MovingAxisDeceleratingForPause  ResumeRequested MovingAxisDeceleratingForResume
+TRANS HomingZAxisDeceleratingForPause ResumeRequested HomingZAxisDeceleratingForResume
+TRANS HomingRAxisDeceleratingForPause ResumeRequested HomingRAxisDeceleratingForResume
+TRANS SequencePaused                  ResumeRequested ReadyForAction                   DequeueEvent
+TRANS MovingAxisPaused                ResumeRequested MovingAxis                       EndHold
+TRANS HomingZAxisPaused               ResumeRequested HomingZAxis                      EndHold       
+TRANS HomingRAxisPaused               ResumeRequested HomingRAxis                      EndHold       
+
+## Only handle clear command when paused or decelerating to paused
+## If the clear is received while the axis is still decelerating, transition to DeceleratingAfterClear 
+## so the system will return to Ready when the pausing deceleration motion is complete
+## If the clear is received when paused, transition directly to Ready
+## In any case, the clear the event queue immediately when handling the clear event
+TRANS+  MovingAxisPaused                ClearRequested --                     ClearEventQueue
+TRANS+  HomingZAxisPaused               ClearRequested --                     ClearEventQueue
+TRANS+  HomingRAxisPaused               ClearRequested --                     ClearEventQueue
+TRANS   *                               ClearRequested --
+TRANS   MovingAxisDeceleratingForPause  ClearRequested DeceleratingAfterClear ClearEventQueue
+TRANS   HomingZAxisDeceleratingForPause ClearRequested DeceleratingAfterClear ClearEventQueue
+TRANS   HomingRAxisDeceleratingForPause ClearRequested DeceleratingAfterClear ClearEventQueue
+TRANS   MovingAxisPaused                ClearRequested Ready                  EndMotion
+TRANS   HomingZAxisPaused               ClearRequested Ready                  EndMotion
+TRANS   HomingRAxisPaused               ClearRequested Ready                  EndMotion
+TRANS   SequencePaused                  ClearRequested Ready                  ClearEventQueue
+TRANS   DeceleratingForSequencePause    ClearRequested DeceleratingAfterClear ClearEventQueue
+
+CODE SetResetFlag             _/OBJ->reset = true;
+CODE EnableMotorDrivers       Motors::Enable();
+CODE DisableMotorDrivers      Motors::Disable();
+CODE MoveZAxis                CHECK_STATUS(MotorController::Move(Z_AXIS, _/EVT.parameter, _/OBJ->zAxisSettings), _/OBJ);
+CODE MoveRAxis                CHECK_STATUS(MotorController::Move(R_AXIS, _/EVT.parameter, _/OBJ->rAxisSettings), _/OBJ);
+CODE SetZAxisSetting          CHECK_STATUS(MotorController::UpdateSettings(Z_AXIS, _/EVT, _/OBJ->zAxisSettings), _/OBJ);
+CODE SetRAxisSetting          CHECK_STATUS(MotorController::UpdateSettings(R_AXIS, _/EVT, _/OBJ->rAxisSettings), _/OBJ);
+CODE HomeZAxis                CHECK_STATUS(MotorController::HomeZAxis(_/EVT.parameter, _/OBJ), _/OBJ);
+CODE HomeRAxis                CHECK_STATUS(MotorController::HomeRAxis(_/EVT.parameter, _/OBJ), _/OBJ);
+CODE BeginHold                Planner::BeginHold();
+CODE EndHold                  Planner::EndHold();
+CODE EndMotion                MotorController::EndMotion();
+CODE EnqueueEvent             CHECK_STATUS(eventQueue.Add(event_code, _/EVT), _/OBJ);
+CODE DequeueEvent             DequeueEvent(_/OBJ);
+CODE GenerateInterrupt        MotorController::GenerateInterrupt();
+CODE ClearEventQueue          eventQueue.Clear();
